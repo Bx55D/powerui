@@ -35,24 +35,6 @@ function Clear-Buffer([char[]]$buf){
     }
 }
 
-function Put-Text([char[]]$buf, [int]$bufW, [int]$bufH, [int]$x, [int]$y, [string]$text){
-    if ([string]::IsNullOrEmpty($text)) { return }
-    if ($y -lt 0 -or $y -ge $bufH) { return }
-
-    if ($x -lt 0) { $x = 0 }
-    if ($x -ge $bufW) { return }
-
-    $stride = $bufW + 1
-    $i = ($y * $stride) + $x
-    $rowEndExclusive = ($y * $stride) + $bufW
-
-    foreach ($ch in $text.ToCharArray()){
-        if ($i -ge $rowEndExclusive) { break }
-        $buf[$i] = $ch
-        $i++
-    }
-}
-
 function Fit-Text([string]$s, [int]$maxLen){
     if ($maxLen -le 0) { return "" }
     if ([string]::IsNullOrEmpty($s)) { return "" }
@@ -85,18 +67,40 @@ function Wrap-Words([string]$text, [int]$maxWidth){
     return $lines
 }
 
+function Put-Text([char[]]$buf, [int]$bufW, [int]$bufH, [int]$x, [int]$y, [string]$text){
+    if ([string]::IsNullOrEmpty($text)) { return }
+    if ($y -lt 0 -or $y -ge $bufH) { return }
+
+    if ($x -lt 0) { $x = 0 }
+    if ($x -ge $bufW) { return }
+
+    $stride = $bufW + 1
+    $i = ($y * $stride) + $x
+    $rowEndExclusive = ($y * $stride) + $bufW  # don't write into newline column
+    $bufLen = $buf.Length
+
+    foreach ($ch in $text.ToCharArray()){
+        # HARD bounds protection (handles resize races / mismatch)
+        if ($i -lt 0 -or $i -ge $bufLen) { break }
+        if ($i -ge $rowEndExclusive) { break }
+
+        $buf[$i] = $ch
+        $i++
+    }
+}
+
 function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index){
 
+    # Tiny fallback
     if ($w -lt 12 -or $h -lt 3){
         Put-Text $buf $w $h 0 0 (Fit-Text "Too small" $w)
         return
     }
 
-    $tl = '┌'; $tr = '┐'; $bl = '└'; $br = '┘'; $v = '│'; $hh = '─'
+    $tl='┌'; $tr='┐'; $bl='└'; $br='┘'; $v='│'; $hh='─'
 
     $minWForBox = 24
     $minHForBox = if ($user_input) { 9 } else { 7 }
-
     $useBox = ($w -ge $minWForBox -and $h -ge $minHForBox)
 
     if (-not $useBox){
@@ -125,14 +129,13 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
         return
     }
 
-    # --- Box mode ---
+    # --- Box mode (responsive sizing) ---
     $width = Clamp ([int]($w * 0.7)) 24 ($w - 2)
-
     $innerMaxW = [Math]::Max(1, $width - 4)
     $wrapped = Wrap-Words $message $innerMaxW
 
-    $minBoxHeight = if ($user_input) { 9 } else { 7 }
     $extraLines = if ($user_input) { 6 } else { 5 }
+    $minBoxHeight = if ($user_input) { 9 } else { 7 }
     $desiredHeight = $wrapped.Count + $extraLines
     $height = Clamp $desiredHeight $minBoxHeight ($h - 2)
 
@@ -141,18 +144,28 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
     if ($padX -lt 0) { $padX = 0 }
     if ($padY -lt 0) { $padY = 0 }
 
-    Put-Text $buf $w $h $padX $padY ($tl + ($hh * ($width - 2)) + $tr)
+    # Final “fit” clamp so we NEVER draw outside (handles racey dimension flips)
+    if ($padX + $width  -gt $w) { $width  = [Math]::Max(1, $w - $padX) }
+    if ($padY + $height -gt $h) { $height = [Math]::Max(1, $h - $padY) }
 
+    if ($width -lt 3 -or $height -lt 3){
+        Put-Text $buf $w $h 0 0 (Fit-Text "Too small" $w)
+        return
+    }
+
+    # Borders
+    Put-Text $buf $w $h $padX $padY ($tl + ($hh * ($width - 2)) + $tr)
     for ($iy = 1; $iy -lt ($height - 1); $iy++){
         Put-Text $buf $w $h $padX ($padY + $iy) ($v + (' ' * ($width - 2)) + $v)
     }
-
     Put-Text $buf $w $h $padX ($padY + $height - 1) ($bl + ($hh * ($width - 2)) + $br)
 
+    # Title
     $title = "Message"
     $titleX = $padX + [int](($width - $title.Length) / 2)
     Put-Text $buf $w $h $titleX ($padY + 1) $title
 
+    # Message
     $msgStartY = $padY + 3
     $maxMsgLines = [Math]::Max(1, ($height - $extraLines))
     $showLines = [Math]::Min($wrapped.Count, $maxMsgLines)
@@ -163,17 +176,22 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
         Put-Text $buf $w $h $x ($msgStartY + $i) $t
     }
 
+    # Controls / Buttons
     if ($user_input){
-        $yes = if ($selected_index -eq 0) { "[ Yes ]" } else { "  Yes  " }
-        $no  = if ($selected_index -eq 1) { "[ No  ]" } else { "  No   " }
+        $yesPlain = if ($selected_index -eq 0) { "[ Yes ]" } else { "  Yes  " }
+        $noPlain  = if ($selected_index -eq 1) { "[ No  ]" } else { "  No   " }
 
-        if ($selected_index -eq 0) { $yes = "`e[97;44m$yes`e[0m" }
-        if ($selected_index -eq 1) { $no  = "`e[97;44m$no`e[0m" }
+        # Apply highlight without using .Length for centering
+        $yesOut = $yesPlain
+        $noOut  = $noPlain
+        if ($selected_index -eq 0) { $yesOut = "`e[97;44m$yesPlain`e[0m" }
+        if ($selected_index -eq 1) { $noOut  = "`e[97;44m$noPlain`e[0m" }
 
-        $btnLine = "$yes   $no"
-        $btnX = $padX + [int](($width - $btnLine.Length) / 2)
+        # Center based on the *plain* lengths (escape codes shouldn’t affect layout)
+        $btnLinePlain = "$yesPlain   $noPlain"
+        $btnX = $padX + [int](($width - $btnLinePlain.Length) / 2)
         $btnY = $padY + $height - 3
-        Put-Text $buf $w $h $btnX $btnY $btnLine
+        Put-Text $buf $w $h $btnX $btnY ("$yesOut   $noOut")
 
         Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "←/→ choose, Enter confirm" ($width - 4))
     } else {
@@ -189,6 +207,7 @@ $h = [Math]::Max(1, [Console]::WindowHeight - 1)
 $buf = New-Buffer $w $h
 
 while ($true){
+    # Read size once per frame (minimizes race window)
     $newW = [Console]::WindowWidth
     $newH = [Math]::Max(1, [Console]::WindowHeight - 1)
 
@@ -202,7 +221,6 @@ while ($true){
 
     while ([Console]::KeyAvailable){
         $key = [Console]::ReadKey($true)
-
         switch ($key.Key){
             'LeftArrow'  { if ($user_input -and $selected_index -gt 0){ $selected_index-- } }
             'RightArrow' { if ($user_input -and $selected_index -lt 1){ $selected_index++ } }
@@ -227,7 +245,7 @@ while ($true){
 
         [Console]::Write($s)
     } catch {
-        # ignore resize races
+        # resize races can throw; ignore and draw next frame
     }
 
     Start-Sleep -Milliseconds 16
