@@ -17,7 +17,6 @@ function New-Buffer([int]$w, [int]$h) {
     $h = [Math]::Max($h, 1)
 
     $buf = New-Object char[] (($w + 1) * $h)
-
     for ($y = 0; $y -lt $h; $y++){
         $line_start = $y * ($w + 1)
         for ($x = 0; $x -lt $w; $x++){
@@ -25,13 +24,32 @@ function New-Buffer([int]$w, [int]$h) {
         }
         $buf[$line_start + $w] = "`n"
     }
-
     ,$buf
 }
 
 function Clear-Buffer([char[]]$buf){
     for ($i = 0; $i -lt $buf.Length; $i++){
         if ($buf[$i] -ne "`n") { $buf[$i] = ' ' }
+    }
+}
+
+function Put-Text([char[]]$buf, [int]$bufW, [int]$bufH, [int]$x, [int]$y, [string]$text){
+    if ([string]::IsNullOrEmpty($text)) { return }
+    if ($y -lt 0 -or $y -ge $bufH) { return }
+
+    if ($x -lt 0) { $x = 0 }
+    if ($x -ge $bufW) { return }
+
+    $stride = $bufW + 1
+    $i = ($y * $stride) + $x
+    $rowEndExclusive = ($y * $stride) + $bufW
+    $bufLen = $buf.Length
+
+    foreach ($ch in $text.ToCharArray()){
+        if ($i -lt 0 -or $i -ge $bufLen) { break }
+        if ($i -ge $rowEndExclusive) { break }
+        $buf[$i] = $ch
+        $i++
     }
 }
 
@@ -67,31 +85,15 @@ function Wrap-Words([string]$text, [int]$maxWidth){
     return $lines
 }
 
-function Put-Text([char[]]$buf, [int]$bufW, [int]$bufH, [int]$x, [int]$y, [string]$text){
-    if ([string]::IsNullOrEmpty($text)) { return }
-    if ($y -lt 0 -or $y -ge $bufH) { return }
-
-    if ($x -lt 0) { $x = 0 }
-    if ($x -ge $bufW) { return }
-
-    $stride = $bufW + 1
-    $i = ($y * $stride) + $x
-    $rowEndExclusive = ($y * $stride) + $bufW  # don't write into newline column
-    $bufLen = $buf.Length
-
-    foreach ($ch in $text.ToCharArray()){
-        # HARD bounds protection (handles resize races / mismatch)
-        if ($i -lt 0 -or $i -ge $bufLen) { break }
-        if ($i -ge $rowEndExclusive) { break }
-
-        $buf[$i] = $ch
-        $i++
-    }
+# Overlays are drawn AFTER the buffer is written, so ANSI codes never affect layout
+$script:Overlays = @()
+function Add-Overlay([int]$x, [int]$y, [string]$text, [string]$ansi){
+    $script:Overlays += [pscustomobject]@{ X=$x; Y=$y; Text=$text; Ansi=$ansi }
 }
 
 function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index){
+    $script:Overlays = @()
 
-    # Tiny fallback
     if ($w -lt 12 -or $h -lt 3){
         Put-Text $buf $w $h 0 0 (Fit-Text "Too small" $w)
         return
@@ -118,18 +120,27 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
         }
 
         if ($user_input){
-            $yes = if ($selected_index -eq 0) { "[Yes]" } else { " Yes " }
-            $no  = if ($selected_index -eq 1) { "[No]"  } else { " No  " }
-            $line = "$yes   $no"
-            $x = [int](($w - $line.Length)/2)
-            Put-Text $buf $w $h $x ($h-1) (Fit-Text $line $w)
+            $yesPlain = "[Yes]"
+            $noPlain  = "[No]"
+            $linePlain = "$yesPlain   $noPlain"
+            $x = [int](($w - $linePlain.Length)/2)
+            $y = $h-1
+
+            Put-Text $buf $w $h $x $y $linePlain
+
+            # Overlay highlight on the selected token only
+            if ($selected_index -eq 0){
+                Add-Overlay $x $y $yesPlain "`e[97;44m"
+            } else {
+                Add-Overlay ($x + $yesPlain.Length + 3) $y $noPlain "`e[97;44m"
+            }
         } else {
             Put-Text $buf $w $h 0 ($h-1) (Fit-Text "Press Enter" $w)
         }
         return
     }
 
-    # --- Box mode (responsive sizing) ---
+    # --- Box mode ---
     $width = Clamp ([int]($w * 0.7)) 24 ($w - 2)
     $innerMaxW = [Math]::Max(1, $width - 4)
     $wrapped = Wrap-Words $message $innerMaxW
@@ -144,28 +155,23 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
     if ($padX -lt 0) { $padX = 0 }
     if ($padY -lt 0) { $padY = 0 }
 
-    # Final “fit” clamp so we NEVER draw outside (handles racey dimension flips)
     if ($padX + $width  -gt $w) { $width  = [Math]::Max(1, $w - $padX) }
     if ($padY + $height -gt $h) { $height = [Math]::Max(1, $h - $padY) }
-
     if ($width -lt 3 -or $height -lt 3){
         Put-Text $buf $w $h 0 0 (Fit-Text "Too small" $w)
         return
     }
 
-    # Borders
     Put-Text $buf $w $h $padX $padY ($tl + ($hh * ($width - 2)) + $tr)
     for ($iy = 1; $iy -lt ($height - 1); $iy++){
         Put-Text $buf $w $h $padX ($padY + $iy) ($v + (' ' * ($width - 2)) + $v)
     }
     Put-Text $buf $w $h $padX ($padY + $height - 1) ($bl + ($hh * ($width - 2)) + $br)
 
-    # Title
     $title = "Message"
     $titleX = $padX + [int](($width - $title.Length) / 2)
     Put-Text $buf $w $h $titleX ($padY + 1) $title
 
-    # Message
     $msgStartY = $padY + 3
     $maxMsgLines = [Math]::Max(1, ($height - $extraLines))
     $showLines = [Math]::Min($wrapped.Count, $maxMsgLines)
@@ -176,24 +182,24 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
         Put-Text $buf $w $h $x ($msgStartY + $i) $t
     }
 
-    # Controls / Buttons
     if ($user_input){
-        $yesPlain = if ($selected_index -eq 0) { "[ Yes ]" } else { "  Yes  " }
-        $noPlain  = if ($selected_index -eq 1) { "[ No  ]" } else { "  No   " }
-
-        # Apply highlight without using .Length for centering
-        $yesOut = $yesPlain
-        $noOut  = $noPlain
-        if ($selected_index -eq 0) { $yesOut = "`e[97;44m$yesPlain`e[0m" }
-        if ($selected_index -eq 1) { $noOut  = "`e[97;44m$noPlain`e[0m" }
-
-        # Center based on the *plain* lengths (escape codes shouldn’t affect layout)
+        # Draw plain button text into buffer so layout is correct
+        $yesPlain = "[ Yes ]"
+        $noPlain  = "[ No  ]"
         $btnLinePlain = "$yesPlain   $noPlain"
+
         $btnX = $padX + [int](($width - $btnLinePlain.Length) / 2)
         $btnY = $padY + $height - 3
-        Put-Text $buf $w $h $btnX $btnY ("$yesOut   $noOut")
 
+        Put-Text $buf $w $h $btnX $btnY $btnLinePlain
         Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "←/→ choose, Enter confirm" ($width - 4))
+
+        # Overlay highlight (ANSI) WITHOUT putting it in the buffer
+        if ($selected_index -eq 0){
+            Add-Overlay $btnX $btnY $yesPlain "`e[97;44m"
+        } else {
+            Add-Overlay ($btnX + $yesPlain.Length + 3) $btnY $noPlain "`e[97;44m"
+        }
     } else {
         Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "Press Enter to continue" ($width - 4))
     }
@@ -207,7 +213,6 @@ $h = [Math]::Max(1, [Console]::WindowHeight - 1)
 $buf = New-Buffer $w $h
 
 while ($true){
-    # Read size once per frame (minimizes race window)
     $newW = [Console]::WindowWidth
     $newH = [Math]::Max(1, [Console]::WindowHeight - 1)
 
@@ -237,15 +242,23 @@ while ($true){
         [Console]::Write("`e[?25l")
         [Console]::SetCursorPosition(0, 0)
 
+        # Write base frame (no ANSI in buffer)
         $s = [string]::new($buf)
         $maxLen = ($w + 1) * $h
         if ($s.Length -gt $maxLen){
             $s = $s.Substring(0, $maxLen)
         }
-
         [Console]::Write($s)
+
+        # Overlay ANSI highlights (doesn't affect layout)
+        foreach ($o in $script:Overlays){
+            if ($o.Y -ge 0 -and $o.Y -lt $h -and $o.X -ge 0 -and $o.X -lt $w){
+                [Console]::SetCursorPosition($o.X, $o.Y)
+                [Console]::Write($o.Ansi + $o.Text + "`e[0m")
+            }
+        }
     } catch {
-        # resize races can throw; ignore and draw next frame
+        # ignore resize races
     }
 
     Start-Sleep -Milliseconds 16
