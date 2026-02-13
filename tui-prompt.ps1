@@ -85,7 +85,7 @@ function Wrap-Words([string]$text, [int]$maxWidth){
     return $lines
 }
 
-# Overlays are drawn AFTER the buffer is written, so ANSI codes never affect layout
+# Overlays get appended into the SAME output string using cursor-positioning
 $script:Overlays = @()
 function Add-Overlay([int]$x, [int]$y, [string]$text, [string]$ansi){
     $script:Overlays += [pscustomobject]@{ X=$x; Y=$y; Text=$text; Ansi=$ansi }
@@ -106,7 +106,6 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
     $useBox = ($w -ge $minWForBox -and $h -ge $minHForBox)
 
     if (-not $useBox){
-        # --- Compact mode ---
         Put-Text $buf $w $h 0 0 (Fit-Text "Message" $w)
 
         $reservedLines = if ($user_input) { 3 } else { 2 }
@@ -123,16 +122,20 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
             $yesPlain = "[Yes]"
             $noPlain  = "[No]"
             $linePlain = "$yesPlain   $noPlain"
-            $x = [int](($w - $linePlain.Length)/2)
-            $y = $h-1
+            if ($linePlain.Length -gt $w){
+                $yesPlain = "[Y]"
+                $noPlain  = "[N]"
+                $linePlain = "$yesPlain $noPlain"
+            }
 
+            $x = [int](($w - $linePlain.Length)/2)
+            $y = $h - 1
             Put-Text $buf $w $h $x $y $linePlain
 
-            # Overlay highlight on the selected token only
             if ($selected_index -eq 0){
                 Add-Overlay $x $y $yesPlain "`e[97;44m"
             } else {
-                Add-Overlay ($x + $yesPlain.Length + 3) $y $noPlain "`e[97;44m"
+                Add-Overlay ($x + ($linePlain.IndexOf($noPlain))) $y $noPlain "`e[97;44m"
             }
         } else {
             Put-Text $buf $w $h 0 ($h-1) (Fit-Text "Press Enter" $w)
@@ -183,22 +186,28 @@ function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index)
     }
 
     if ($user_input){
-        # Draw plain button text into buffer so layout is correct
+        # Plain button text must fit INSIDE the box (width-2 columns between borders)
         $yesPlain = "[ Yes ]"
         $noPlain  = "[ No  ]"
         $btnLinePlain = "$yesPlain   $noPlain"
 
-        $btnX = $padX + [int](($width - $btnLinePlain.Length) / 2)
+        $insideWidth = $width - 2
+        if ($btnLinePlain.Length -gt $insideWidth){
+            $yesPlain = "[Y]"
+            $noPlain  = "[N]"
+            $btnLinePlain = "$yesPlain $noPlain"
+        }
+
+        $btnX = $padX + 1 + [int](($insideWidth - $btnLinePlain.Length) / 2)
         $btnY = $padY + $height - 3
 
         Put-Text $buf $w $h $btnX $btnY $btnLinePlain
         Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "←/→ choose, Enter confirm" ($width - 4))
 
-        # Overlay highlight (ANSI) WITHOUT putting it in the buffer
         if ($selected_index -eq 0){
             Add-Overlay $btnX $btnY $yesPlain "`e[97;44m"
         } else {
-            Add-Overlay ($btnX + $yesPlain.Length + 3) $btnY $noPlain "`e[97;44m"
+            Add-Overlay ($btnX + ($btnLinePlain.IndexOf($noPlain))) $btnY $noPlain "`e[97;44m"
         }
     } else {
         Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "Press Enter to continue" ($width - 4))
@@ -242,21 +251,28 @@ while ($true){
         [Console]::Write("`e[?25l")
         [Console]::SetCursorPosition(0, 0)
 
-        # Write base frame (no ANSI in buffer)
-        $s = [string]::new($buf)
+        $base = [string]::new($buf)
         $maxLen = ($w + 1) * $h
-        if ($s.Length -gt $maxLen){
-            $s = $s.Substring(0, $maxLen)
+        if ($base.Length -gt $maxLen){
+            $base = $base.Substring(0, $maxLen)
         }
-        [Console]::Write($s)
 
-        # Overlay ANSI highlights (doesn't affect layout)
+        # Single write: base frame + cursor-position overlays
+        $out = $base
+
         foreach ($o in $script:Overlays){
             if ($o.Y -ge 0 -and $o.Y -lt $h -and $o.X -ge 0 -and $o.X -lt $w){
-                [Console]::SetCursorPosition($o.X, $o.Y)
-                [Console]::Write($o.Ansi + $o.Text + "`e[0m")
+                # ANSI cursor positions are 1-based: ESC[{row};{col}H
+                $row = $o.Y + 1
+                $col = $o.X + 1
+                $out += "`e[$row;${col}H" + $o.Ansi + $o.Text + "`e[0m"
             }
         }
+
+        # Return cursor to home so next frame is consistent
+        $out += "`e[H"
+
+        [Console]::Write($out)
     } catch {
         # ignore resize races
     }
