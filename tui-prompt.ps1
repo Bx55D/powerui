@@ -3,132 +3,241 @@ param(
     [Parameter(Mandatory)]
     [string]$message,
 
-    $user_input = $false
+    [bool]$user_input = $false
 )
 
 function Clamp([int]$v, [int]$min, [int]$max){
-    if ($v -lt $min){
-        return $min
-    }
-
-    if ($v -gt $max){
-        return $max
-    }
-
+    if ($v -lt $min){ return $min }
+    if ($v -gt $max){ return $max }
     return $v
 }
 
 function New-Buffer([int]$w, [int]$h) {
+    $w = [Math]::Max($w, 1)
+    $h = [Math]::Max($h, 1)
+
     $buf = New-Object char[] (($w + 1) * $h)
 
     for ($y = 0; $y -lt $h; $y++){
         $line_start = $y * ($w + 1)
         for ($x = 0; $x -lt $w; $x++){
-        $buf[$line_start + $x] = " "
-            
+            $buf[$line_start + $x] = " "
         }
         $buf[$line_start + $w] = "`n"
     }
 
-    Write-Output $buf -NoEnumerate
+    ,$buf
 }
 
-function Put-Text([char[]]$buf, [int]$x, [int]$y, [string]$text){
-    $w = [Console]::WindowWidth
-    $stride = $w + 1
+function Clear-Buffer([char[]]$buf){
+    for ($i = 0; $i -lt $buf.Length; $i++){
+        if ($buf[$i] -ne "`n") { $buf[$i] = ' ' }
+    }
+}
+
+function Put-Text([char[]]$buf, [int]$bufW, [int]$bufH, [int]$x, [int]$y, [string]$text){
+    if ([string]::IsNullOrEmpty($text)) { return }
+    if ($y -lt 0 -or $y -ge $bufH) { return }
+
+    if ($x -lt 0) { $x = 0 }
+    if ($x -ge $bufW) { return }
+
+    $stride = $bufW + 1
     $i = ($y * $stride) + $x
-    $max = ($y+1) * $stride - 1
+    $rowEndExclusive = ($y * $stride) + $bufW  # don't write into newline
+
     foreach ($ch in $text.ToCharArray()){
-        if ($i -ge $max){ break }
-        $buf[$i++] = $ch
+        if ($i -ge $rowEndExclusive) { break }
+        $buf[$i] = $ch
+        $i++
     }
 }
 
-function Render-MessageBox([char[]]$screen_buffer, $selected_index) {
-    $windowWidth = [Console]::WindowWidth
-    $windowHeight = [Console]::WindowHeight    
-    
-    $width = [int](Clamp ([int]([Console]::WindowWidth * 0.6)) 30 300)
-    $height = 16
+function Fit-Text([string]$s, [int]$maxLen){
+    if ($maxLen -le 0) { return "" }
+    if ([string]::IsNullOrEmpty($s)) { return "" }
+    if ($s.Length -le $maxLen) { return $s }
+    if ($maxLen -le 1) { return $s.Substring(0, $maxLen) }
+    return $s.Substring(0, $maxLen - 1) + "…"
+}
 
-    $tl = '┌'; $bl = '└'; $tr = '┐'; $br = '┘'; $v = '│'; $h = '─'
+function Render-MessageBox([char[]]$buf, [int]$w, [int]$h, [int]$selected_index){
 
-    $padX = [int](([Console]::WindowWidth-$width)/2)
-    $padY = [int](([Console]::WindowHeight-$height)/2)
-
-    Put-Text $screen_buffer $padX $padY ($tl + ($h*($width-2)) + $tr)
-
-    for ($i = 1; $i -lt $height; $i++){
-        Put-Text $screen_buffer $padX ($padY+$i) ($v + (' '*($width-2)) + $v)
+    # Extremely tiny fallback
+    if ($w -lt 12 -or $h -lt 3){
+        Put-Text $buf $w $h 0 0 (Fit-Text "Too small" $w)
+        return
     }
 
-    Put-Text $screen_buffer $padX ($padY+$height) ($bl + ($h*($width-2)) + $br)
+    $tl = '┌'; $tr = '┐'; $bl = '└'; $br = '┘'; $v = '│'; $hh = '─'
 
-    $textPadX = [int](([Console]::WindowWidth-$message.Length)/2)
+    # Decide layout
+    $minWForBox = 24
+    $minHForBox = (if ($user_input) { 9 } else { 7 })
+    $useBox = ($w -ge $minWForBox -and $h -ge $minHForBox)
 
-    Put-Text $screen_buffer $textPadX ([int]([Console]::WindowHeight/2)) $message
+    if (-not $useBox){
+        # Compact mode: title line + message lines + optional yes/no line
+        $title = "Message"
+        Put-Text $buf $w $h 0 0 (Fit-Text $title $w)
 
+        $maxMsgLines = [Math]::Max(1, $h - (if ($user_input) { 3 } else { 2 }))
+        $msg = $message
+
+        # crude wrapping by words
+        $words = $msg -split '\s+'
+        $lines = New-Object System.Collections.Generic.List[string]
+        $cur = ""
+        foreach ($word in $words){
+            if ($cur.Length -eq 0){
+                $cur = $word
+            } elseif (($cur.Length + 1 + $word.Length) -le $w){
+                $cur = "$cur $word"
+            } else {
+                $lines.Add($cur)
+                $cur = $word
+            }
+        }
+        if ($cur.Length -gt 0) { $lines.Add($cur) }
+
+        for ($i=0; $i -lt [Math]::Min($lines.Count, $maxMsgLines); $i++){
+            Put-Text $buf $w $h 0 (1 + $i) (Fit-Text $lines[$i] $w)
+        }
+
+        if ($user_input){
+            $yes = if ($selected_index -eq 0) { "[Yes]" } else { " Yes " }
+            $no  = if ($selected_index -eq 1) { "[No]"  } else { " No  " }
+            $line = "$yes   $no"
+            $x = [int](($w - $line.Length)/2)
+            Put-Text $buf $w $h $x ($h-1) (Fit-Text $line $w)
+        } else {
+            Put-Text $buf $w $h 0 ($h-1) (Fit-Text "Press Enter" $w)
+        }
+        return
+    }
+
+    # Box mode: width relative to screen, always fitting
+    $width = Clamp ([int]($w * 0.7)) 24 ($w - 2)
+
+    # Responsive height: based on message length + optional buttons, but capped
+    $innerMaxW = [Math]::Max(1, $width - 4)
+    $words = ($message -split '\s+')
+    $wrapped = New-Object System.Collections.Generic.List[string]
+    $line = ""
+    foreach ($word in $words){
+        if ($line.Length -eq 0){
+            $line = $word
+        } elseif (($line.Length + 1 + $word.Length) -le $innerMaxW){
+            $line = "$line $word"
+        } else {
+            $wrapped.Add($line)
+            $line = $word
+        }
+    }
+    if ($line.Length -gt 0) { $wrapped.Add($line) }
+
+    $minBoxHeight = (if ($user_input) { 9 } else { 7 })
+    $desiredHeight = $wrapped.Count + (if ($user_input) { 6 } else { 5 })  # borders + padding
+    $height = Clamp $desiredHeight $minBoxHeight ($h - 2)
+
+    $padX = [int](($w - $width) / 2)
+    $padY = [int](($h - $height) / 2)
+    if ($padX -lt 0) { $padX = 0 }
+    if ($padY -lt 0) { $padY = 0 }
+
+    # Top border
+    Put-Text $buf $w $h $padX $padY ($tl + ($hh * ($width - 2)) + $tr)
+
+    # Sides
+    for ($iy = 1; $iy -lt ($height - 1); $iy++){
+        Put-Text $buf $w $h $padX ($padY + $iy) ($v + (' ' * ($width - 2)) + $v)
+    }
+
+    # Bottom border (corrected)
+    Put-Text $buf $w $h $padX ($padY + $height - 1) ($bl + ($hh * ($width - 2)) + $br)
+
+    # Title (if space)
+    $title = "Message"
+    $titleX = $padX + [int](($width - $title.Length) / 2)
+    Put-Text $buf $w $h $titleX ($padY + 1) $title
+
+    # Message lines (centered vertically-ish)
+    $msgStartY = $padY + 3
+    $maxMsgLines = [Math]::Max(1, ($height - (if ($user_input) { 6 } else { 5 })))
+    $showLines = [Math]::Min($wrapped.Count, $maxMsgLines)
+
+    for ($i=0; $i -lt $showLines; $i++){
+        $t = Fit-Text $wrapped[$i] $innerMaxW
+        $x = $padX + 2 + [int](($innerMaxW - $t.Length) / 2)
+        Put-Text $buf $w $h $x ($msgStartY + $i) $t
+    }
+
+    # Buttons
     if ($user_input){
-        $prompt_affirm_string = if ($selected_index -eq 0){ "[Yes]" } else { "Yes" }
-        $prompt_negative_string = if ($selected_index -eq 1){ "[No]" } else { "No" }
+        $yes = if ($selected_index -eq 0) { "[ Yes ]" } else { "  Yes  " }
+        $no  = if ($selected_index -eq 1) { "[ No  ]" } else { "  No   " }
 
-        $option_spacing = ([int]($width/3))
+        # highlight selection with background across token (optional)
+        if ($selected_index -eq 0) { $yes = "`e[97;44m$yes`e[0m" }
+        if ($selected_index -eq 1) { $no  = "`e[97;44m$no`e[0m" }
 
-        Put-Text $screen_buffer ($padX + ([int]($width/3)) - 3) ($padY + $height - 3) ($prompt_affirm_string + (" "*$option_spacing) + $prompt_negative_string)
+        $btnLine = "$yes   $no"
+        $btnX = $padX + [int](($width - ($btnLine.Length)) / 2)
+        $btnY = $padY + $height - 3
+        Put-Text $buf $w $h $btnX $btnY $btnLine
+
+        Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "←/→ to choose, Enter to confirm" ($width - 4))
+    } else {
+        Put-Text $buf $w $h ($padX + 2) ($padY + $height - 2) (Fit-Text "Press Enter to continue" ($width - 4))
     }
 }
 
-
-$esc = [char]27
-$w = [Console]::WindowWidth
-$h = [Console]::WindowHeight-1
-
-$buf = New-Buffer $w $h
-
+# --- main ---
 $selected_index = 0
 
+$w = [Console]::WindowWidth
+$h = [Math]::Max(1, [Console]::WindowHeight - 1)
+$buf = New-Buffer $w $h
+
 while ($true){
-    if ($w -eq [Console]::WindowWidth -and $h -eq [Console]::WindowHeight-1){
-        # Clear Buffer
-        for ($i = 0; $i -lt $buf.Length; $i++){
-            if ($buf[$i] -ne "`n") { $buf[$i] = ' ' }
-        }
-    } else {
-        # Resize
-        $w = [Console]::WindowWidth
-        $h = [Console]::WindowHeight-1
+    $newW = [Console]::WindowWidth
+    $newH = [Math]::Max(1, [Console]::WindowHeight - 1)
+
+    if ($newW -ne $w -or $newH -ne $h){
+        $w = $newW
+        $h = $newH
         $buf = New-Buffer $w $h
+    } else {
+        Clear-Buffer $buf
     }
 
-    # User Input
     while ([Console]::KeyAvailable){
         $key = [Console]::ReadKey($true)
-        
+
         switch ($key.Key){
-            'LeftArrow' {
-                if ($selected_index -gt 0){
-                    $selected_index-=1
-                }
-            }
-            'RightArrow' {
-                if ($selected_index -lt 1){
-                    $selected_index+=1
-                }
-            }
-            'Enter' {
-                return $selected_index
-            }
+            'LeftArrow'  { if ($user_input -and $selected_index -gt 0){ $selected_index-- } }
+            'RightArrow' { if ($user_input -and $selected_index -lt 1){ $selected_index++ } }
+            'Enter'      { return $selected_index }
+            'Escape'     { return 1 }  # treat Esc as "No" (adjust if you want)
         }
     }
 
-    # Render-Search $stdin_buffer $buf
-    Render-MessageBox $buf $selected_index
+    Render-MessageBox $buf $w $h $selected_index
 
-    
-    [Console]::Write("`e[?25l") # Hide Cursor
+    try {
+        [Console]::Write("`e[?25l")  # hide cursor
+        [Console]::SetCursorPosition(0, 0)
 
-    [Console]::SetCursorPosition(0, 0)
-    [Console]::Write([string]::new($buf))
+        $s = [string]::new($buf)
+        $maxLen = ($w + 1) * $h
+        if ($s.Length -gt $maxLen){
+            $s = $s.Substring(0, $maxLen)
+        }
+
+        [Console]::Write($s)
+    } catch {
+        # ignore resize race errors
+    }
 
     Start-Sleep -Milliseconds 16
 }
